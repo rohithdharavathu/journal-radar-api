@@ -18,7 +18,15 @@
       "Bash(vercel projects *)",
       "Bash(vercel --yes)",
       "Bash(vercel --prod --yes)",
-      "Bash(curl *)"
+      "Bash(curl *)",
+      "Bash(npx skills *)",
+      "Bash(pip install *)",
+      "Bash(SUPABASE_DB_URL=\"postgresql://postgres:Rambabu@6112@db.wbiharsgqnayajqhmldt.supabase.co:5432/postgres\" python rebuild_index.py)",
+      "Bash(SUPABASE_DB_URL=\"postgresql://postgres:Rambabu%406112@db.wbiharsgqnayajqhmldt.supabase.co:5432/postgres\" python rebuild_index.py)",
+      "mcp__claude_ai_Supabase__get_project",
+      "Bash(SUPABASE_DB_URL=\"postgresql://postgres.wbiharsgqnayajqhmldt:Rambabu%406112@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres\" python rebuild_index.py)",
+      "mcp__claude_ai_Supabase__apply_migration",
+      "mcp__claude_ai_Supabase__execute_sql"
     ]
   }
 }

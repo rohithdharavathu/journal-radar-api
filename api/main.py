@@ -1,8 +1,9 @@
 """JournalRadar AI Service — FastAPI
 
 Endpoints:
-  POST /match  — embed abstract, cosine search journals, post-filter, return top N
+  POST /match  — classify abstract domain, embed, cosine search within domain, return top N
   GET  /health — liveness probe
+  GET  /debug  — connection test
 
 Rate limit: 10 requests/minute per IP
 """
@@ -22,7 +23,7 @@ from supabase import create_client
 load_dotenv()
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="JournalRadar AI", version="2.0")
+app = FastAPI(title="JournalRadar AI", version="2.1")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -38,19 +39,82 @@ supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
 QUARTILE_RANK = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
 
+# Exact subject_area values from journals table
+SUBJECT_AREAS = [
+    "Medicine",
+    "Arts and Humanities",
+    "Social Sciences",
+    "Agricultural and Biological Sciences",
+    "Computer Science",
+    "Biochemistry, Genetics and Molecular Biology",
+    "Engineering",
+    "Business, Management and Accounting",
+    "Earth and Planetary Sciences",
+    "Mathematics",
+    "Economics, Econometrics and Finance",
+    "Psychology",
+    "Health Professions",
+    "Environmental Science",
+    "Chemistry",
+    "Chemical Engineering",
+    "Energy",
+    "Immunology and Microbiology",
+    "Materials Science",
+    "Dentistry",
+    "Physics and Astronomy",
+    "Nursing",
+    "Neuroscience",
+    "Veterinary",
+    "Pharmacology, Toxicology and Pharmaceutics",
+    "Decision Sciences",
+    "Multidisciplinary",
+]
+
+CLASSIFY_PROMPT = (
+    "You are a research domain classifier. Given an abstract, return ONLY the single most "
+    "relevant subject area from the list below — exact string, nothing else.\n\n"
+    + "\n".join(f"- {s}" for s in SUBJECT_AREAS)
+)
+
+
+def classify_subject(abstract: str) -> Optional[str]:
+    """Use GPT-4o-mini to map the abstract to one subject area from the fixed list."""
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": CLASSIFY_PROMPT},
+                {"role": "user", "content": abstract[:2000]},
+            ],
+            max_tokens=20,
+            temperature=0,
+        )
+        classified = resp.choices[0].message.content.strip()
+        return classified if classified in SUBJECT_AREAS else None
+    except Exception:
+        return None
+
 
 class MatchRequest(BaseModel):
     abstract: str
     max_apc_usd: Optional[float] = None
     min_quartile: Optional[str] = None
+    subject_area: Optional[str] = None  # override auto-classification
     limit: int = 10
+
+    @field_validator("subject_area")
+    @classmethod
+    def validate_subject_area(cls, v: Optional[str]) -> Optional[str]:
+        if v and v not in SUBJECT_AREAS:
+            raise ValueError(f"subject_area must be one of the known domains")
+        return v
 
     @field_validator("abstract")
     @classmethod
     def validate_abstract(cls, v: str) -> str:
         v = v.strip()
-        if len(v) < 50:
-            raise ValueError("Abstract must be at least 50 characters")
+        if len(v) < 3:
+            raise ValueError("Query must be at least 3 characters")
         return v[:8000]
 
     @field_validator("min_quartile")
@@ -69,97 +133,108 @@ class MatchRequest(BaseModel):
 @app.post("/match")
 @limiter.limit("10/minute")
 async def match_journals(request: Request, body: MatchRequest):
-    # Step 1: Generate embedding from abstract
+    # Step 1: Classify subject domain (auto or manual override)
+    subject_filter = body.subject_area
+    if not subject_filter:
+        subject_filter = classify_subject(body.abstract)
+
+    # Step 2: Generate embedding from abstract
     try:
         emb = openai_client.embeddings.create(
             model="text-embedding-3-small",
             input=body.abstract,
         )
-        vector = emb.data[0].embedding  # plain Python list of 1536 floats
+        vector = emb.data[0].embedding
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Embedding error: {e}")
 
-    # Step 2: Convert vector to string format for pgvector RPC
-    # supabase-py sends lists as JSON arrays but PostgreSQL vector type
-    # requires string format "[0.1,0.2,...]" for correct casting
     vector_str = "[" + ",".join(str(v) for v in vector) + "]"
 
-    # Step 3: Run cosine similarity search via Supabase RPC
+    # Step 3: Vector search within the classified subject domain
+    # Over-fetch more when additional filters will further reduce results
+    fetch_multiplier = 10 if (body.min_quartile or body.max_apc_usd is not None) else 5
     try:
         result = supabase.rpc("match_journals", {
             "query_embedding": vector_str,
-            "match_count": body.limit * 4,  # over-fetch for post-filtering
+            "match_count": body.limit * fetch_multiplier,
+            "subject_filter": subject_filter,
         }).execute()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Database error: {e}")
 
-    # Step 4: Post-filter and format results
+    # Step 4: Post-filter, threshold, format
+    MIN_SIMILARITY = 0.15
     matches = []
     for row in result.data or []:
-        # Quartile filter
-        if body.min_quartile:
-            row_rank = QUARTILE_RANK.get(row.get("quartile") or "", 99)
-            min_rank = QUARTILE_RANK[body.min_quartile]
-            if row_rank > min_rank:
-                continue
+        sim = float(row.get("similarity", 0))
+        if sim < MIN_SIMILARITY:
+            continue
 
-        # APC filter
+        if body.min_quartile:
+            row_quartile = row.get("quartile")
+            if row_quartile:  # skip journals with no quartile only when filtering
+                if QUARTILE_RANK.get(row_quartile, 99) > QUARTILE_RANK[body.min_quartile]:
+                    continue
+
         if body.max_apc_usd is not None:
             apc = row.get("apc_amount_usd")
-            if apc is not None and float(apc) > body.max_apc_usd:
-                continue
+            if apc is not None:
+                try:
+                    if float(apc) > body.max_apc_usd:
+                        continue
+                except (ValueError, TypeError):
+                    pass
 
+        category = row.get("subject_category") or row.get("subject_area") or "your field"
         matches.append({
             **row,
-            "similarity_score": round(float(row.get("similarity", 0)), 4),
-            "match_reason": f"Strong match in {row.get('subject_area') or 'your field'}",
+            "similarity_score": round(sim, 4),
+            "detected_domain": subject_filter,
+            "match_reason": f"Semantic match in {category}",
         })
 
         if len(matches) >= body.limit:
             break
 
-    return matches
+    return {
+        "detected_domain": subject_filter,
+        "results": matches,
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.0"}
+    return {"status": "ok", "version": "2.1"}
+
 
 @app.get("/debug")
 async def debug():
-    """Test if OpenAI and Supabase connections work."""
-    # Test OpenAI
     try:
         emb = openai_client.embeddings.create(
             model="text-embedding-3-small",
             input="test deepfake detection"
         )
         vector = emb.data[0].embedding
-        vector_len = len(vector)
-        vector_sample = vector[:3]
+        vector_str = "[" + ",".join(str(v) for v in vector) + "]"
     except Exception as e:
         return {"error": f"OpenAI failed: {e}"}
 
-    # Test Supabase RPC with string vector
     try:
-        vector_str = "[" + ",".join(str(v) for v in vector) + "]"
         result = supabase.rpc("match_journals", {
             "query_embedding": vector_str,
             "match_count": 3,
+            "subject_filter": "Computer Science",
         }).execute()
-        top_result = result.data[0] if result.data else None
+        top = result.data[0] if result.data else None
     except Exception as e:
-        return {
-            "openai": "ok",
-            "vector_len": vector_len,
-            "error": f"Supabase failed: {e}"
-        }
+        return {"openai": "ok", "error": f"Supabase failed: {e}"}
+
+    classified = classify_subject("deepfake detection using transformers and frequency domain analysis")
 
     return {
         "openai": "ok",
-        "vector_len": vector_len,
-        "vector_sample": vector_sample,
         "supabase": "ok",
-        "top_match": top_result.get("title") if top_result else None,
-        "top_similarity": top_result.get("similarity") if top_result else None,
+        "classify_test": classified,
+        "top_match": top.get("title") if top else None,
+        "top_similarity": top.get("similarity") if top else None,
     }
