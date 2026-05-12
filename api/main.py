@@ -124,3 +124,42 @@ async def match_journals(request: Request, body: MatchRequest):
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "2.0"}
+
+@app.get("/debug")
+async def debug():
+    """Test if OpenAI and Supabase connections work."""
+    # Test OpenAI
+    try:
+        emb = openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input="test deepfake detection"
+        )
+        vector = emb.data[0].embedding
+        vector_len = len(vector)
+        vector_sample = vector[:3]
+    except Exception as e:
+        return {"error": f"OpenAI failed: {e}"}
+
+    # Test Supabase RPC with string vector
+    try:
+        vector_str = "[" + ",".join(str(v) for v in vector) + "]"
+        result = supabase.rpc("match_journals", {
+            "query_embedding": vector_str,
+            "match_count": 3,
+        }).execute()
+        top_result = result.data[0] if result.data else None
+    except Exception as e:
+        return {
+            "openai": "ok",
+            "vector_len": vector_len,
+            "error": f"Supabase failed: {e}"
+        }
+
+    return {
+        "openai": "ok",
+        "vector_len": vector_len,
+        "vector_sample": vector_sample,
+        "supabase": "ok",
+        "top_match": top_result.get("title") if top_result else None,
+        "top_similarity": top_result.get("similarity") if top_result else None,
+    }
