@@ -1,17 +1,16 @@
 """JournalRadar AI Service — FastAPI
 
 Endpoints:
-  POST /match  — classify abstract domain, embed, cosine search within domain, return top N
-  GET  /health — liveness probe
-  GET  /debug  — connection test
-
-Rate limit: 10 requests/minute per IP
+  POST /match          — classify abstract domain, embed, cosine search within domain, return top N
+  GET  /similar/{id}  — find journals similar to a given journal by embedding
+  GET  /autocomplete  — journal name suggestions as user types
+  GET  /health        — liveness probe
 """
 import os
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel, field_validator
@@ -23,13 +22,19 @@ from supabase import create_client
 load_dotenv()
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="JournalRadar AI", version="2.1")
+app = FastAPI(title="JournalRadar AI", version="3.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+ALLOWED_ORIGINS = [
+    "https://frontend-omega-green-75.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
@@ -37,9 +42,10 @@ app.add_middleware(
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
+API_SECRET = os.environ.get("API_SECRET_KEY", "")
+
 QUARTILE_RANK = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
 
-# Exact subject_area values from journals table
 SUBJECT_AREAS = [
     "Medicine",
     "Arts and Humanities",
@@ -77,8 +83,14 @@ CLASSIFY_PROMPT = (
 )
 
 
+def verify_api_key(x_api_key: str = Header(None)):
+    if not API_SECRET:
+        return  # dev mode — skip validation
+    if x_api_key != API_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+
 def classify_subject(abstract: str) -> Optional[str]:
-    """Use GPT-4o-mini to map the abstract to one subject area from the fixed list."""
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -88,6 +100,7 @@ def classify_subject(abstract: str) -> Optional[str]:
             ],
             max_tokens=20,
             temperature=0,
+            timeout=8.0,
         )
         classified = resp.choices[0].message.content.strip()
         return classified if classified in SUBJECT_AREAS else None
@@ -95,18 +108,33 @@ def classify_subject(abstract: str) -> Optional[str]:
         return None
 
 
+def generate_match_reason(score: float, subject_area: Optional[str], subject_category: Optional[str]) -> str:
+    pct = round(score * 100)
+    area = subject_area or "your research area"
+    category = subject_category or ""
+
+    if pct >= 80:
+        return f"Highly relevant — papers on {category or area} are frequently published here"
+    elif pct >= 65:
+        return f"Good match — your topic aligns with {category or area} literature in this journal"
+    elif pct >= 50:
+        return f"Related work in {area} has been published here"
+    else:
+        return f"Some overlap with {area} research in this journal"
+
+
 class MatchRequest(BaseModel):
     abstract: str
     max_apc_usd: Optional[float] = None
     min_quartile: Optional[str] = None
-    subject_area: Optional[str] = None  # override auto-classification
+    subject_area: Optional[str] = None
     limit: int = 10
 
     @field_validator("subject_area")
     @classmethod
     def validate_subject_area(cls, v: Optional[str]) -> Optional[str]:
         if v and v not in SUBJECT_AREAS:
-            raise ValueError(f"subject_area must be one of the known domains")
+            raise ValueError("subject_area must be one of the known domains")
         return v
 
     @field_validator("abstract")
@@ -131,18 +159,17 @@ class MatchRequest(BaseModel):
 
 
 @app.post("/match")
-@limiter.limit("10/minute")
-async def match_journals(request: Request, body: MatchRequest):
-    # Step 1: Classify subject domain (auto or manual override)
+@limiter.limit("30/minute")
+async def match_journals(request: Request, body: MatchRequest, _=Depends(verify_api_key)):
     subject_filter = body.subject_area
     if not subject_filter:
         subject_filter = classify_subject(body.abstract)
 
-    # Step 2: Generate embedding from abstract
     try:
         emb = openai_client.embeddings.create(
             model="text-embedding-3-small",
             input=body.abstract,
+            timeout=10.0,
         )
         vector = emb.data[0].embedding
     except Exception as e:
@@ -150,8 +177,6 @@ async def match_journals(request: Request, body: MatchRequest):
 
     vector_str = "[" + ",".join(str(v) for v in vector) + "]"
 
-    # Step 3: Vector search within the classified subject domain
-    # Over-fetch more when additional filters will further reduce results
     fetch_multiplier = 10 if (body.min_quartile or body.max_apc_usd is not None) else 5
     try:
         result = supabase.rpc("match_journals", {
@@ -162,7 +187,6 @@ async def match_journals(request: Request, body: MatchRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Database error: {e}")
 
-    # Step 4: Post-filter, threshold, format
     MIN_SIMILARITY = 0.15
     matches = []
     for row in result.data or []:
@@ -172,7 +196,7 @@ async def match_journals(request: Request, body: MatchRequest):
 
         if body.min_quartile:
             row_quartile = row.get("quartile")
-            if row_quartile:  # skip journals with no quartile only when filtering
+            if row_quartile:
                 if QUARTILE_RANK.get(row_quartile, 99) > QUARTILE_RANK[body.min_quartile]:
                     continue
 
@@ -185,12 +209,15 @@ async def match_journals(request: Request, body: MatchRequest):
                 except (ValueError, TypeError):
                     pass
 
-        category = row.get("subject_category") or row.get("subject_area") or "your field"
         matches.append({
             **row,
             "similarity_score": round(sim, 4),
             "detected_domain": subject_filter,
-            "match_reason": f"Semantic match in {category}",
+            "match_reason": generate_match_reason(
+                sim,
+                row.get("subject_area"),
+                row.get("subject_category"),
+            ),
         })
 
         if len(matches) >= body.limit:
@@ -202,39 +229,47 @@ async def match_journals(request: Request, body: MatchRequest):
     }
 
 
+@app.get("/similar/{journal_id}")
+@limiter.limit("30/minute")
+async def similar_journals(journal_id: int, request: Request, _=Depends(verify_api_key)):
+    result = supabase.table("journals") \
+        .select("embedding, title") \
+        .eq("id", journal_id) \
+        .single() \
+        .execute()
+
+    if not result.data or not result.data.get("embedding"):
+        raise HTTPException(404, "Journal not found or has no embedding")
+
+    embedding = result.data["embedding"]
+    vector_str = "[" + ",".join(str(v) for v in embedding) + "]"
+
+    similar = supabase.rpc("match_journals", {
+        "query_embedding": vector_str,
+        "match_count": 9,
+    }).execute()
+
+    filtered = [r for r in (similar.data or []) if r["id"] != journal_id][:8]
+    return filtered
+
+
+@app.get("/autocomplete")
+@limiter.limit("60/minute")
+async def autocomplete(q: str, request: Request, limit: int = 6, _=Depends(verify_api_key)):
+    if len(q.strip()) < 2:
+        return {"suggestions": []}
+
+    result = supabase.table("journals") \
+        .select("id, title, publisher, quartile, subject_area") \
+        .ilike("title", f"%{q}%") \
+        .eq("is_active", True) \
+        .order("sjr_score", desc=True) \
+        .limit(max(1, min(limit, 10))) \
+        .execute()
+
+    return {"suggestions": result.data or []}
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.1"}
-
-
-@app.get("/debug")
-async def debug():
-    try:
-        emb = openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input="test deepfake detection"
-        )
-        vector = emb.data[0].embedding
-        vector_str = "[" + ",".join(str(v) for v in vector) + "]"
-    except Exception as e:
-        return {"error": f"OpenAI failed: {e}"}
-
-    try:
-        result = supabase.rpc("match_journals", {
-            "query_embedding": vector_str,
-            "match_count": 3,
-            "subject_filter": "Computer Science",
-        }).execute()
-        top = result.data[0] if result.data else None
-    except Exception as e:
-        return {"openai": "ok", "error": f"Supabase failed: {e}"}
-
-    classified = classify_subject("deepfake detection using transformers and frequency domain analysis")
-
-    return {
-        "openai": "ok",
-        "supabase": "ok",
-        "classify_test": classified,
-        "top_match": top.get("title") if top else None,
-        "top_similarity": top.get("similarity") if top else None,
-    }
+    return {"status": "ok", "version": "3.0"}
