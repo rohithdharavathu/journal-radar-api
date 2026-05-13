@@ -26,7 +26,18 @@
       "mcp__claude_ai_Supabase__get_project",
       "Bash(SUPABASE_DB_URL=\"postgresql://postgres.wbiharsgqnayajqhmldt:Rambabu%406112@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres\" python rebuild_index.py)",
       "mcp__claude_ai_Supabase__apply_migration",
-      "mcp__claude_ai_Supabase__execute_sql"
+      "mcp__claude_ai_Supabase__execute_sql",
+      "Bash(pip index *)",
+      "Bash(railway *)",
+      "Bash(git push *)",
+      "Bash(git add *)",
+      "Bash(claude doctor *)",
+      "Bash(where claude *)",
+      "Bash(claude --version)",
+      "PowerShell(claude doctor *)",
+      "PowerShell(& \"C:\\\\Users\\\\LENOVO\\\\AppData\\\\Roaming\\\\npm\\\\node_modules\\\\@anthropic-ai\\\\claude-code\\\\bin\\\\claude.exe\" doctor 2>&1)",
+      "Bash(npx tsc *)",
+      "mcp__claude_ai_Supabase__list_projects"
     ]
   }
 }

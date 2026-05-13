@@ -130,8 +130,8 @@ def _query_fast_engineering(sb):
 LISTS.append((
     {
         'slug': 'fast-publication-engineering',
-        'title': 'Fast Publication Engineering Journals',
-        'description': 'Engineering journals known for quick turnaround — under 12 weeks on average',
+        'title': 'Top Q1 Engineering Journals',
+        'description': 'The highest-ranked Q1 Scopus journals in Engineering by SJR score',
         'icon': '⚡',
         'subject_area': 'Engineering',
     },
@@ -243,14 +243,14 @@ LISTS.append((
 ))
 
 
-# 8. Affordable Q1/Q2 Journals (APC < $3000)
+# 8. Diamond OA / Free to publish Q1+Q2 journals
 def _query_low_apc_q2(sb):
+    # Use publishing_model since apc_amount_usd data is sparse
     r = (
         sb.table('journals')
         .select('id')
         .in_('quartile', ['Q1', 'Q2'])
-        .gt('apc_amount_usd', 0)
-        .lt('apc_amount_usd', 3000)
+        .in_('publishing_model', ['diamond_oa', 'subscription'])
         .eq('is_active', True)
         .order('sjr_score', desc=True)
         .limit(20)
@@ -261,8 +261,8 @@ def _query_low_apc_q2(sb):
 LISTS.append((
     {
         'slug': 'low-apc-q2-journals',
-        'title': 'Affordable Q1/Q2 Journals',
-        'description': 'Top-quartile Scopus journals with APC under $3000 — quality without breaking the bank',
+        'title': 'Free to Publish Q1/Q2 Journals',
+        'description': 'Top-quartile Scopus journals with no author fees — Diamond OA or subscription model',
         'icon': '🎯',
         'subject_area': None,
     },
