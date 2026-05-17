@@ -16,8 +16,24 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.issn import parse_issn_pair
 
-INPUT = Path(__file__).parent / "data" / "scimagojr_2025.csv"
-OUTPUT = Path(__file__).parent / "data" / "scimago_clean.json"
+DATA_DIR = Path(__file__).parent / "data"
+OUTPUT = DATA_DIR / "scimago_clean.json"
+
+
+def _find_scimago_csv() -> Path:
+    """Pick the most recent scimagojr_<year>.csv in data/."""
+    candidates = sorted(DATA_DIR.glob("scimagojr_*.csv"), reverse=True)
+    if not candidates:
+        raise FileNotFoundError(
+            "No scimagojr_*.csv found in scripts/data/.\n"
+            "Run: python 00_download_sources.py"
+        )
+    chosen = candidates[0]
+    print(f"  Using Scimago file: {chosen.name}")
+    return chosen
+
+
+INPUT = _find_scimago_csv()
 
 DIRECT_QUARTILE_COLS = ['SJR Best Quartile', 'Quartile (best)', 'Best Quartile', 'Quartile']
 CATEGORY_COLS = ['Categories', 'Subject Category', 'Subject Categories']

@@ -1,0 +1,77 @@
+name: Annual Data Refresh
+
+on:
+  # Runs Feb 1 at 06:00 UTC every year — Scimago usually releases Jan/Feb
+  schedule:
+    - cron: '0 6 1 2 *'
+
+  # Also allows manual trigger from GitHub Actions UI (Actions tab → Run workflow)
+  workflow_dispatch:
+    inputs:
+      skip_download:
+        description: 'Skip download step (use files already in repo)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  refresh:
+    name: Refresh journal data
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Download sources (DOAJ + Scimago)
+        if: ${{ inputs.skip_download != 'true' }}
+        run: python scripts/00_download_sources.py
+        continue-on-error: true   # Scimago may block CI IPs; pipeline continues if local file exists
+
+      - name: Parse Scimago CSV
+        run: python scripts/01_parse_scimago.py
+
+      - name: Parse DOAJ CSV
+        run: python scripts/02_parse_doaj.py
+
+      - name: Merge datasets
+        run: python scripts/03_merge_datasets.py
+
+      - name: Upsert to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/04_seed_supabase.py
+
+      - name: Recompute quartile trends
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/08_compute_trends.py
+
+      - name: Notify success
+        if: success()
+        run: |
+          echo "Annual refresh complete."
+          echo "Journals upserted, quartile trends recomputed."
+          echo "Optional: run 17_openalex_enrichment.py manually (~90 min) to refresh topics."
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "Annual refresh FAILED. Check logs above."
+          echo "If Scimago blocked the download, download manually:"
+          echo "  https://www.scimagojr.com/journalrank.php  → Export to CSV"
+          echo "  Save as scripts/data/scimagojr_$(date +%Y).csv"
+          echo "Then re-run with: workflow_dispatch + skip_download=false"
